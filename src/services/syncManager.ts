@@ -1,156 +1,56 @@
-import { collection, query, where, getDocs, doc, writeBatch, getDoc, setDoc, runTransaction, deleteDoc } from 'firebase/firestore';
+import { doc, writeBatch, setDoc, deleteDoc, getDoc } from 'firebase/firestore';
 import { db, auth } from '../firebase';
-import { Note, SyncLedger, OperationType } from '../types';
-import { computeHash, removeUndefined } from '../lib/utils';
+import { Note, SyncLedger } from '../types';
+import { removeUndefined, computeHash } from '../lib/utils';
 import * as dbManager from './dbManager';
 
 export const isFirebaseBackupEnabled = () => {
   return localStorage.getItem('firebaseBackupEnabled') === 'true';
 };
 
-export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) => void) => {
+export const getBackupInterval = (): number => {
+  const intervalStr = localStorage.getItem('firebaseBackupInterval');
+  return intervalStr ? parseInt(intervalStr, 10) : 0; // 0 means manual only
+};
+
+export const setBackupInterval = (intervalMs: number) => {
+  localStorage.setItem('firebaseBackupInterval', intervalMs.toString());
+};
+
+export const getLastBackupTime = (): Date | null => {
+  const timeStr = localStorage.getItem('lastFirebaseBackupTime');
+  return timeStr ? new Date(timeStr) : null;
+};
+
+export const backupToFirebase = async (projectId: string): Promise<void> => {
   if (!auth.currentUser || !isFirebaseBackupEnabled()) {
-    const finalLocalNotes = await dbManager.getAllNotes();
-    return finalLocalNotes.filter(n => n.projectId === projectId);
+    return;
   }
 
-  const lastSyncedAtKey = `lastSyncedAt_${projectId}`;
-  const lastSyncedAtStr = localStorage.getItem(lastSyncedAtKey);
-  const lastSyncedAt = lastSyncedAtStr ? new Date(lastSyncedAtStr) : new Date(0);
-  const syncStartTime = new Date().toISOString();
-
-  // 1. Fetch Manifest Document from Firestore
-  const manifestRef = doc(db, 'sync_manifests', projectId);
-  let manifestData: Record<string, string> = {};
   try {
-    const manifestSnap = await getDoc(manifestRef);
-    if (manifestSnap.exists()) {
-      manifestData = manifestSnap.data().fileShaMap || {};
+    const dirtyNotes = await dbManager.getDirtyNotes();
+    const notesToBackup = dirtyNotes.filter(n => n.projectId === projectId);
+
+    if (notesToBackup.length === 0) {
+      return; // Nothing to backup
     }
-  } catch (error) {
-    console.error("Firebase sync failed:", error);
-    // If Firebase fails, just return local notes
-    const finalLocalNotes = await dbManager.getAllNotes();
-    return finalLocalNotes.filter(n => n.projectId === projectId);
-  }
 
-  // 2. Get Local Data
-  const allLocalNotes = await dbManager.getAllNotes();
-  const localNotes = allLocalNotes.filter(n => n.projectId === projectId);
-
-  // 3. Compare
-  const toFetch: string[] = [];
-  const toUpload: Note[] = [];
-
-  // Find local notes that need uploading
-  localNotes.forEach(local => {
-    const localUpdated = typeof local.lastUpdated === 'string' ? new Date(local.lastUpdated) : new Date(0);
-    if (localUpdated > lastSyncedAt) {
-      toUpload.push(local);
-    }
-  });
-
-  // Find remote notes that need fetching
-  Object.entries(manifestData).forEach(([id, value]) => {
-    // value could be a hash (old format) or an ISO string (new format)
-    const remoteUpdated = new Date(value);
-    const isOldFormat = isNaN(remoteUpdated.getTime());
-    
-    let isNewer = false;
-    if (isOldFormat) {
-      // Old format: value is a hash. Compare with local hash.
-      const localNote = localNotes.find(n => n.id === id);
-      if (!localNote || localNote.contentHash !== value) {
-        isNewer = true;
-      }
-    } else {
-      isNewer = remoteUpdated > lastSyncedAt;
-    }
-    
-    if (isNewer) {
-      // If we are already uploading this note, compare timestamps if possible
-      const uploadingNote = toUpload.find(n => n.id === id);
-      if (uploadingNote) {
-        if (!isOldFormat) {
-          const localUpdated = typeof uploadingNote.lastUpdated === 'string' ? new Date(uploadingNote.lastUpdated) : new Date(0);
-          if (remoteUpdated > localUpdated) {
-            // Remote wins
-            toUpload.splice(toUpload.indexOf(uploadingNote), 1);
-            toFetch.push(id);
-          }
-        } else {
-          // Old format (hash). If we are uploading it, local wins. Do not fetch.
-          // It will be uploaded and the manifest will be updated to the new format.
-        }
-      } else {
-        toFetch.push(id);
-      }
-    }
-  });
-
-  // 4. Upload local notes to Firebase
-  if (toUpload.length > 0) {
-    for (let i = 0; i < toUpload.length; i += 50) {
-      const batch = writeBatch(db);
-      const chunk = toUpload.slice(i, i + 50);
+    // We might need multiple batches if we have a lot of dirty notes
+    // For simplicity, we'll process in chunks of 100 notes (each note might take 2-3 operations)
+    for (let i = 0; i < notesToBackup.length; i += 100) {
+      const currentBatch = writeBatch(db);
+      const chunk = notesToBackup.slice(i, i + 100);
       
       for (const note of chunk) {
         const noteRef = doc(db, 'notes', note.id);
-        const { parentNoteIds, childNoteIds, relatedNoteIds, embedding, ...metadata } = note;
-        const cleanMetadata = removeUndefined({ 
-          ...metadata,
-          projectId: String(projectId),
-          title: String(note.title || ''),
-          summary: String(note.summary || ''),
-          folder: String(note.folder || '/'),
-          noteType: note.noteType || 'Domain',
-          status: note.status || 'Planned',
-          priority: note.priority || 'C',
-          uid: String(auth.currentUser?.uid),
-          lastUpdated: typeof note.lastUpdated === 'string' 
-            ? note.lastUpdated 
-            : new Date().toISOString()
-        });
-
-        if ('createdAt' in cleanMetadata) {
-          delete cleanMetadata.createdAt;
-        }
-        
-        batch.set(noteRef, cleanMetadata, { merge: true });
-        
-        // Update Content
         const contentRef = doc(db, 'note_contents', note.id);
-        batch.set(contentRef, {
-          id: note.id,
-          body: String(note.body || ''),
-          components: note.components,
-          flow: note.flow,
-          io: note.io
-        }, { merge: true });
+        const embeddingRef = doc(db, 'note_embeddings', note.id);
 
-        // Update Embedding if present
-        if (embedding) {
-          const embeddingRef = doc(db, 'note_embeddings', note.id);
-          batch.set(embeddingRef, {
-            id: note.id,
-            embedding: embedding,
-            embeddingHash: note.embeddingHash,
-            embeddingModel: note.embeddingModel,
-            lastEmbeddedAt: note.lastEmbeddedAt
-          }, { merge: true });
-        }
-        
-        // Update manifestData locally to be saved later
-        manifestData[note.id] = cleanMetadata.lastUpdated;
-      }
-      
-      try {
-        await batch.commit();
-      } catch (error) {
-        console.error('Error uploading batch of notes:', error);
-        // Fallback to individual uploads
-        for (const note of chunk) {
-          const noteRef = doc(db, 'notes', note.id);
+        if (note.deleted) {
+          currentBatch.delete(noteRef);
+          currentBatch.delete(contentRef);
+          currentBatch.delete(embeddingRef);
+        } else {
           const { parentNoteIds, childNoteIds, relatedNoteIds, embedding, ...metadata } = note;
           const cleanMetadata = removeUndefined({ 
             ...metadata,
@@ -170,128 +70,69 @@ export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) 
           if ('createdAt' in cleanMetadata) {
             delete cleanMetadata.createdAt;
           }
+          if ('isDirty' in cleanMetadata) {
+            delete cleanMetadata.isDirty;
+          }
+          if ('deleted' in cleanMetadata) {
+            delete cleanMetadata.deleted;
+          }
           
-          try {
-            await setDoc(noteRef, cleanMetadata, { merge: true });
-            
-            // Update Content
-            const contentRef = doc(db, 'note_contents', note.id);
-            await setDoc(contentRef, {
+          currentBatch.set(noteRef, cleanMetadata, { merge: true });
+          
+          currentBatch.set(contentRef, removeUndefined({
+            id: note.id,
+            body: String(note.body || ''),
+            components: note.components,
+            flow: note.flow,
+            io: note.io
+          }), { merge: true });
+
+          if (embedding) {
+            currentBatch.set(embeddingRef, removeUndefined({
               id: note.id,
-              body: String(note.body || ''),
-              components: note.components,
-              flow: note.flow,
-              io: note.io
-            }, { merge: true });
-
-            // Update Embedding if present
-            if (embedding) {
-              const embeddingRef = doc(db, 'note_embeddings', note.id);
-              await setDoc(embeddingRef, {
-                id: note.id,
-                embedding: embedding,
-                embeddingHash: note.embeddingHash,
-                embeddingModel: note.embeddingModel,
-                lastEmbeddedAt: note.lastEmbeddedAt
-              }, { merge: true });
-            }
-            
-            manifestData[note.id] = cleanMetadata.lastUpdated;
-          } catch (err) {
-            console.error('Failed to upload note:', note.id, err);
+              embedding: embedding,
+              embeddingHash: note.embeddingHash,
+              embeddingModel: note.embeddingModel,
+              lastEmbeddedAt: note.lastEmbeddedAt
+            }), { merge: true });
           }
         }
       }
+      
+      await currentBatch.commit();
     }
+
+    // Mark notes as clean locally
+    await dbManager.markNotesClean(notesToBackup.map(n => n.id));
     
-    // Save updated manifest
-    try {
-      await setDoc(manifestRef, { fileShaMap: manifestData }, { merge: true });
-    } catch (error) {
-      console.error("Failed to update sync manifest", error);
+    // Update last backup time
+    localStorage.setItem('lastFirebaseBackupTime', new Date().toISOString());
+
+  } catch (error: any) {
+    console.error('Firebase backup failed:', error);
+    if (error.message && (error.message.includes('Quota exceeded') || error.message.includes('resource-exhausted'))) {
+      throw new Error('QUOTA_EXCEEDED');
     }
+    throw error;
   }
+};
 
-  // 5. Fetch remote notes
-  if (toFetch.length > 0) {
-    const fetchedNotes: Note[] = [];
-    const BATCH_SIZE = 30;
-    for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
-      const batchIds = toFetch.slice(i, i + BATCH_SIZE);
-      const promises = batchIds.map(async (id) => {
-        try {
-          const [metaSnap, contentSnap, embeddingSnap] = await Promise.all([
-            getDoc(doc(db, 'notes', id)),
-            getDoc(doc(db, 'note_contents', id)),
-            getDoc(doc(db, 'note_embeddings', id))
-          ]);
-          
-          if (metaSnap.exists()) {
-            const data = { 
-              id: metaSnap.id, 
-              ...metaSnap.data(),
-              ...(contentSnap.exists() ? contentSnap.data() : {}),
-              ...(embeddingSnap.exists() ? embeddingSnap.data() : {})
-            } as Note;
-            return data;
-          }
-        } catch (error) {
-          console.error("Failed to fetch remote note", id, error);
-        }
-        return null;
-      });
-      const results = await Promise.all(promises);
-      fetchedNotes.push(...results.filter((n): n is Note => n !== null));
-    }
-    if (fetchedNotes.length > 0) {
-      await dbManager.bulkSaveNotes(fetchedNotes);
-      if (onProgress) {
-        const updatedLocalNotes = await dbManager.getAllNotes();
-        onProgress(updatedLocalNotes.filter(n => n.projectId === projectId));
-      }
-    }
-  }
-
-  // 6. Update lastSyncedAt
-  localStorage.setItem(lastSyncedAtKey, syncStartTime);
-
+// We keep syncNotes as a wrapper that just returns local notes and triggers backup
+export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) => void) => {
+  // Trigger backup in background
+  backupToFirebase(projectId).catch(console.error);
+  
+  // Return local notes immediately
   const finalLocalNotes = await dbManager.getAllNotes();
   return finalLocalNotes.filter(n => n.projectId === projectId);
 };
 
 export const deleteNoteFromSync = async (noteId: string, projectId: string) => {
-  // Delete Local
+  // Delete Local (Soft delete, marks as dirty)
   await dbManager.deleteNote(noteId);
-
-  if (!auth.currentUser || !isFirebaseBackupEnabled()) return;
-
-  // Delete Remote
-  try {
-    await Promise.all([
-      deleteDoc(doc(db, 'notes', noteId)),
-      deleteDoc(doc(db, 'note_contents', noteId)),
-      deleteDoc(doc(db, 'note_embeddings', noteId))
-    ]);
-  } catch (error) {
-    console.error("Failed to delete remote note", error);
-  }
-
-  // Delete from Manifest
-  const manifestRef = doc(db, 'sync_manifests', projectId);
-  try {
-    await runTransaction(db, async (transaction) => {
-      const manifestDoc = await transaction.get(manifestRef);
-      if (manifestDoc.exists()) {
-        const manifestData = manifestDoc.data().fileShaMap || {};
-        if (manifestData[noteId]) {
-          delete manifestData[noteId];
-          transaction.set(manifestRef, { fileShaMap: manifestData }, { merge: false });
-        }
-      }
-    });
-  } catch (error) {
-    console.error("Failed to update manifest after delete", error);
-  }
+  
+  // Trigger background backup
+  backupToFirebase(projectId).catch(console.error);
 };
 
 export const saveNoteToSync = async (note: Note) => {
@@ -300,55 +141,62 @@ export const saveNoteToSync = async (note: Note) => {
   const contentHash = await computeHash(content);
   const noteWithHash = { ...note, contentHash };
 
-  // Save Local
+  // Save Local (marks as dirty)
   await dbManager.saveNote(noteWithHash);
+  
+  // Trigger background backup
+  backupToFirebase(note.projectId).catch(console.error);
+};
 
-  if (!auth.currentUser || !isFirebaseBackupEnabled()) return;
+// --- Sync Ledger Functions ---
+export const syncLedger = async (projectId: string, localLedger: SyncLedger | undefined): Promise<SyncLedger | undefined> => {
+  if (!auth.currentUser || !isFirebaseBackupEnabled()) {
+    return localLedger;
+  }
 
-  // Save Remote - Partial Update
-  const noteRef = doc(db, 'notes', note.id);
+  const ledgerRef = doc(db, 'sync_ledgers', projectId);
+  
   try {
-    const { parentNoteIds, childNoteIds, relatedNoteIds, embedding, ...metadata } = noteWithHash;
-    const cleanMetadata = removeUndefined({ 
-      ...metadata,
-      projectId: String(noteWithHash.projectId),
-      title: String(noteWithHash.title || ''),
-      summary: String(noteWithHash.summary || ''),
-      folder: String(noteWithHash.folder || '/'),
-      noteType: noteWithHash.noteType || 'Domain',
-      status: noteWithHash.status || 'Planned',
-      priority: noteWithHash.priority || 'C',
-      uid: String(auth.currentUser?.uid),
-      lastUpdated: typeof noteWithHash.lastUpdated === 'string' 
-        ? noteWithHash.lastUpdated 
-        : new Date().toISOString()
-    });
-
-    // Update Metadata
-    await setDoc(noteRef, cleanMetadata, { merge: true });
-
-    // Update Content
-    const contentRef = doc(db, 'note_contents', note.id);
-    await setDoc(contentRef, {
-      id: note.id,
-      body: String(noteWithHash.body || ''),
-      components: noteWithHash.components,
-      flow: noteWithHash.flow,
-      io: noteWithHash.io
-    }, { merge: true });
-
-    // Update Embedding if present
-    if (embedding) {
-      const embeddingRef = doc(db, 'note_embeddings', note.id);
-      await setDoc(embeddingRef, {
-        id: note.id,
-        embedding: embedding,
-        embeddingHash: noteWithHash.embeddingHash,
-        embeddingModel: noteWithHash.embeddingModel,
-        lastEmbeddedAt: noteWithHash.lastEmbeddedAt
-      }, { merge: true });
+    const ledgerSnap = await getDoc(ledgerRef);
+    
+    if (!ledgerSnap.exists()) {
+      if (localLedger) {
+        await setDoc(ledgerRef, localLedger);
+      }
+      return localLedger;
     }
+    
+    const remoteLedger = ledgerSnap.data() as SyncLedger;
+    
+    if (!localLedger) {
+      await dbManager.saveSyncLedger(remoteLedger);
+      return remoteLedger;
+    }
+    
+    const localUpdated = new Date(localLedger.lastSyncedAt);
+    const remoteUpdated = new Date(remoteLedger.lastSyncedAt);
+    
+    if (localUpdated > remoteUpdated) {
+      await setDoc(ledgerRef, localLedger);
+      return localLedger;
+    } else if (remoteUpdated > localUpdated) {
+      await dbManager.saveSyncLedger(remoteLedger);
+      return remoteLedger;
+    }
+    
+    return localLedger;
   } catch (error) {
-    console.error("Failed to save remote note", error);
+    console.error("Firebase ledger sync failed:", error);
+    return localLedger;
+  }
+};
+
+export const saveLedgerToFirebase = async (ledger: SyncLedger) => {
+  if (!auth.currentUser || !isFirebaseBackupEnabled()) return;
+  try {
+    const ledgerRef = doc(db, 'sync_ledgers', ledger.projectId);
+    await setDoc(ledgerRef, ledger);
+  } catch (error) {
+    console.error("Failed to save ledger to Firebase:", error);
   }
 };

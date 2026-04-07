@@ -76,6 +76,7 @@ export interface NoteMetadata {
   uid: string;
   createdAt: any;
   isDirty?: boolean; // For local-first sync
+  deleted?: boolean; // For soft deletion
 }
 
 export interface NoteContent {

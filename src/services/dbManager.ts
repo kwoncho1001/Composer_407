@@ -82,7 +82,9 @@ export const getAllNotes = async (): Promise<Note[]> => {
     db.getAll(STORE_EDGES)
   ]);
 
-  return metadata.map(meta => {
+  const activeMetadata = metadata.filter(meta => !meta.deleted);
+
+  return activeMetadata.map(meta => {
     const content = contents.find(c => c.id === meta.id);
     const embedding = embeddings.find(e => e.id === meta.id);
     const noteEdges = edges.filter(e => e.sourceId === meta.id || e.targetId === meta.id);
@@ -117,12 +119,12 @@ export const saveNote = async (note: Note) => {
 
 export const deleteNote = async (id: string) => {
   const db = await initDB();
-  const tx = db.transaction([STORE_METADATA, STORE_CONTENTS, STORE_EMBEDDINGS, STORE_EDGES], 'readwrite');
-  await Promise.all([
-    tx.objectStore(STORE_METADATA).delete(id),
-    tx.objectStore(STORE_CONTENTS).delete(id),
-    tx.objectStore(STORE_EMBEDDINGS).delete(id),
-  ]);
+  const tx = db.transaction([STORE_METADATA], 'readwrite');
+  const metadataStore = tx.objectStore(STORE_METADATA);
+  const metadata = await metadataStore.get(id);
+  if (metadata) {
+    await metadataStore.put({ ...metadata, deleted: true, isDirty: true });
+  }
   await tx.done;
 };
 
@@ -144,11 +146,63 @@ export const bulkSaveNotes = async (notes: Note[]) => {
 
 export const bulkDeleteNotes = async (ids: string[]) => {
   const db = await initDB();
-  const tx = db.transaction([STORE_METADATA, STORE_CONTENTS, STORE_EMBEDDINGS, STORE_EDGES], 'readwrite');
-  await Promise.all(ids.map(id => Promise.all([
-    tx.objectStore(STORE_METADATA).delete(id),
-    tx.objectStore(STORE_CONTENTS).delete(id),
-    tx.objectStore(STORE_EMBEDDINGS).delete(id),
-  ])));
+  const tx = db.transaction([STORE_METADATA], 'readwrite');
+  const metadataStore = tx.objectStore(STORE_METADATA);
+  await Promise.all(ids.map(async id => {
+    const metadata = await metadataStore.get(id);
+    if (metadata) {
+      await metadataStore.put({ ...metadata, deleted: true, isDirty: true });
+    }
+  }));
+  await tx.done;
+};
+
+export const getDirtyNotes = async (): Promise<Note[]> => {
+  const db = await initDB();
+  const [metadata, contents, embeddings, edges] = await Promise.all([
+    db.getAll(STORE_METADATA),
+    db.getAll(STORE_CONTENTS),
+    db.getAll(STORE_EMBEDDINGS),
+    db.getAll(STORE_EDGES)
+  ]);
+
+  const dirtyMetadata = metadata.filter(meta => meta.isDirty);
+
+  return dirtyMetadata.map(meta => {
+    const content = contents.find(c => c.id === meta.id);
+    const embedding = embeddings.find(e => e.id === meta.id);
+    const noteEdges = edges.filter(e => e.sourceId === meta.id || e.targetId === meta.id);
+    
+    return {
+      ...meta,
+      ...content,
+      ...embedding,
+      parentNoteIds: noteEdges.filter(e => e.targetId === meta.id && e.type === 'parent').map(e => e.sourceId),
+      childNoteIds: noteEdges.filter(e => e.sourceId === meta.id && e.type === 'child').map(e => e.targetId),
+      relatedNoteIds: noteEdges.filter(e => e.sourceId === meta.id && e.type === 'related').map(e => e.targetId),
+    } as Note;
+  });
+};
+
+export const markNotesClean = async (ids: string[]) => {
+  const db = await initDB();
+  const tx = db.transaction([STORE_METADATA, STORE_CONTENTS, STORE_EMBEDDINGS], 'readwrite');
+  const metadataStore = tx.objectStore(STORE_METADATA);
+  const contentsStore = tx.objectStore(STORE_CONTENTS);
+  const embeddingsStore = tx.objectStore(STORE_EMBEDDINGS);
+  
+  await Promise.all(ids.map(async id => {
+    const metadata = await metadataStore.get(id);
+    if (metadata) {
+      if (metadata.deleted) {
+        // If it was deleted and now synced, we can permanently delete it from local DB
+        await metadataStore.delete(id);
+        await contentsStore.delete(id);
+        await embeddingsStore.delete(id);
+      } else {
+        await metadataStore.put({ ...metadata, isDirty: false });
+      }
+    }
+  }));
   await tx.done;
 };

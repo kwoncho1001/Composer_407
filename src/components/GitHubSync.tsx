@@ -721,212 +721,221 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
 
           if (cancelSyncRef.current) break;
 
-          // Phase 5: Tree Assembly & Persistence
-          addLog(`  Phase 5: Tree Assembly & Persistence...`);
-          for (const result of fileLogicUnits) {
-            if (result.error) continue;
-            
-            const { unit, file: currentFile, analysis, businessLogic, unitHash, caseType, targetLogicB, targetSnapshotB, isConflict, conflictDetails, logicAEmbedding, logicHash } = result;
-
-            const snapshotId = targetSnapshotB ? targetSnapshotB.id : crypto.randomUUID();
-            
-            if (caseType === '4-1') {
-              const logicUpdates: any = {
-                status: isConflict ? 'Conflict' : 'Done',
-                lastUpdated: new Date().toISOString(),
-                uid: auth.currentUser?.uid || 'local',
-                sha: currentFile.sha,
-                lens: 'Feature',
-                ...(conflictDetails ? { conflictDetails } : {}),
-                ...(unitHash ? { contentHash: unitHash } : {}),
-                ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
-                ...(logicHash ? { embeddingHash: logicHash } : {}),
-                embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: new Date().toISOString()
-              };
-
-              if (!isConflict && !result.isCacheHit) {
-                logicUpdates.title = businessLogic.title.substring(0, 200);
-                logicUpdates.summary = businessLogic.summary;
-                logicUpdates.components = businessLogic.components;
-                logicUpdates.flow = businessLogic.flow;
-                logicUpdates.io = businessLogic.io;
-                logicUpdates.conflictDetails = null;
-              }
-
-              localNotesBatch.push({ ...targetLogicB, ...logicUpdates, id: targetLogicB.id } as Note);
+            // Phase 5: Tree Assembly & Persistence
+            addLog(`  Phase 5: Tree Assembly & Persistence...`);
+            for (const result of fileLogicUnits) {
+              if (result.error) continue;
               
-              const snapshotUpdates: any = {
-                lastUpdated: new Date().toISOString(),
-                sha: currentFile.sha,
-                uid: auth.currentUser?.uid || 'local',
-                lens: 'Snapshot',
-                ...(unitHash ? { contentHash: unitHash } : {})
-              };
-              
-              if (!result.isCacheHit) {
-                snapshotUpdates.title = analysis.title.substring(0, 200);
-                snapshotUpdates.summary = analysis.summary;
-                snapshotUpdates.components = analysis.components;
-                snapshotUpdates.flow = analysis.flow;
-                snapshotUpdates.io = analysis.io;
-                snapshotUpdates.body = unit.code;
-              }
+              const { unit, file: currentFile, analysis, businessLogic, unitHash, caseType, targetLogicB, targetSnapshotB, isConflict, conflictDetails, logicAEmbedding, logicHash } = result;
 
-              localNotesBatch.push({ ...targetSnapshotB, ...snapshotUpdates, id: targetSnapshotB.id } as Note);
+              const snapshotId = targetSnapshotB ? targetSnapshotB.id : crypto.randomUUID();
               
-            } else if (caseType === '4-2') {
-              const logicUpdates: any = {
-                childNoteIds: Array.from(new Set([...(targetLogicB.childNoteIds || []), snapshotId])),
-                status: isConflict ? 'Conflict' : 'Done',
-                lastUpdated: new Date().toISOString(),
-                uid: auth.currentUser?.uid || 'local',
-                sha: currentFile.sha,
-                lens: 'Feature',
-                ...(conflictDetails ? { conflictDetails } : {}),
-                ...(unitHash ? { contentHash: unitHash } : {}),
-                ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
-                ...(logicHash ? { embeddingHash: logicHash } : {}),
-                embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: new Date().toISOString()
-              };
+              if (caseType === '4-1') {
+                const logicUpdates: any = {
+                  status: isConflict ? 'Conflict' : 'Done',
+                  lastUpdated: new Date().toISOString(),
+                  uid: auth.currentUser?.uid || 'local',
+                  sha: currentFile.sha,
+                  lens: 'Feature',
+                  ...(conflictDetails ? { conflictDetails } : {}),
+                  ...(unitHash ? { contentHash: unitHash } : {}),
+                  ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
+                  ...(logicHash ? { embeddingHash: logicHash } : {}),
+                  embeddingModel: 'gemini-embedding-2-preview',
+                  lastEmbeddedAt: new Date().toISOString()
+                };
 
-              if (!isConflict) {
-                logicUpdates.conflictDetails = null;
-              }
+                if (!isConflict && !result.isCacheHit) {
+                  logicUpdates.title = businessLogic.title.substring(0, 200);
+                  logicUpdates.summary = businessLogic.summary;
+                  logicUpdates.components = businessLogic.components;
+                  logicUpdates.flow = businessLogic.flow;
+                  logicUpdates.io = businessLogic.io;
+                  logicUpdates.conflictDetails = null;
+                }
 
-              localNotesBatch.push({ ...targetLogicB, ...logicUpdates, id: targetLogicB.id } as Note);
-              
-              const snapshotData: Partial<Note> = {
-                id: snapshotId,
-                title: analysis.title.substring(0, 200),
-                projectId,
-                summary: analysis.summary || '',
-                components: analysis.components || null,
-                flow: analysis.flow || null,
-                io: analysis.io || null,
-                body: unit.code || '',
-                folder: currentFile.path,
-                noteType: 'Snapshot',
-                status: 'Done',
-                priority: 'Done',
-                parentNoteIds: [targetLogicB.id],
-                childNoteIds: [],
-                relatedNoteIds: [],
-                originPath: currentFile.path,
-                sha: currentFile.sha,
-                uid: auth.currentUser?.uid || 'local',
-                lastUpdated: new Date().toISOString() as any,
-                lens: 'Snapshot',
-                ...(unitHash ? { contentHash: unitHash } : {})
-              };
-              allNotes.push(snapshotData as Note);
-              localNotesBatch.push(snapshotData as Note);
-              
-            } else if (caseType === '4-3') {
-              const logicId = crypto.randomUUID();
-              
-              // Find best matching module for the new logic note
-              let parentModuleIds: string[] = [];
-              if (moduleEmbeddings.length > 0 && logicAEmbedding) {
-                let bestModule = null;
-                let maxSim = -1;
-                for (let j = 0; j < existingModules.length; j++) {
-                  const sim = cosineSimilarity(logicAEmbedding, moduleEmbeddings[j]);
-                  if (sim > maxSim) {
-                    maxSim = sim;
-                    bestModule = existingModules[j];
+                localNotesBatch.push({ ...targetLogicB, ...logicUpdates, id: targetLogicB.id } as Note);
+                
+                const snapshotUpdates: any = {
+                  lastUpdated: new Date().toISOString(),
+                  sha: currentFile.sha,
+                  uid: auth.currentUser?.uid || 'local',
+                  lens: 'Snapshot',
+                  ...(unitHash ? { contentHash: unitHash } : {})
+                };
+                
+                if (!result.isCacheHit) {
+                  snapshotUpdates.title = analysis.title.substring(0, 200);
+                  snapshotUpdates.summary = analysis.summary;
+                  snapshotUpdates.components = analysis.components;
+                  snapshotUpdates.flow = analysis.flow;
+                  snapshotUpdates.io = analysis.io;
+                  snapshotUpdates.body = unit.code;
+                }
+
+                localNotesBatch.push({ ...targetSnapshotB, ...snapshotUpdates, id: targetSnapshotB.id } as Note);
+                
+              } else if (caseType === '4-2') {
+                const logicUpdates: any = {
+                  childNoteIds: Array.from(new Set([...(targetLogicB.childNoteIds || []), snapshotId])),
+                  status: isConflict ? 'Conflict' : 'Done',
+                  lastUpdated: new Date().toISOString(),
+                  uid: auth.currentUser?.uid || 'local',
+                  sha: currentFile.sha,
+                  lens: 'Feature',
+                  ...(conflictDetails ? { conflictDetails } : {}),
+                  ...(unitHash ? { contentHash: unitHash } : {}),
+                  ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
+                  ...(logicHash ? { embeddingHash: logicHash } : {}),
+                  embeddingModel: 'gemini-embedding-2-preview',
+                  lastEmbeddedAt: new Date().toISOString()
+                };
+
+                if (!isConflict) {
+                  logicUpdates.conflictDetails = null;
+                }
+
+                localNotesBatch.push({ ...targetLogicB, ...logicUpdates, id: targetLogicB.id } as Note);
+                
+                const snapshotData: Partial<Note> = {
+                  id: snapshotId,
+                  title: analysis.title.substring(0, 200),
+                  projectId,
+                  summary: analysis.summary || '',
+                  components: analysis.components || null,
+                  flow: analysis.flow || null,
+                  io: analysis.io || null,
+                  body: unit.code || '',
+                  folder: currentFile.path,
+                  noteType: 'Snapshot',
+                  status: 'Done',
+                  priority: 'Done',
+                  parentNoteIds: [targetLogicB.id],
+                  childNoteIds: [],
+                  relatedNoteIds: [],
+                  originPath: currentFile.path,
+                  sha: currentFile.sha,
+                  uid: auth.currentUser?.uid || 'local',
+                  lastUpdated: new Date().toISOString() as any,
+                  lens: 'Snapshot',
+                  ...(unitHash ? { contentHash: unitHash } : {})
+                };
+                allNotes.push(snapshotData as Note);
+                localNotesBatch.push(snapshotData as Note);
+                
+              } else if (caseType === '4-3') {
+                const logicId = crypto.randomUUID();
+                
+                // Find best matching module for the new logic note
+                let parentModuleIds: string[] = [];
+                if (moduleEmbeddings.length > 0 && logicAEmbedding) {
+                  let bestModule = null;
+                  let maxSim = -1;
+                  for (let j = 0; j < existingModules.length; j++) {
+                    const sim = cosineSimilarity(logicAEmbedding, moduleEmbeddings[j]);
+                    if (sim > maxSim) {
+                      maxSim = sim;
+                      bestModule = existingModules[j];
+                    }
+                  }
+                  // Use a threshold for module mapping during sync as well
+                  if (bestModule && maxSim >= 0.7) {
+                    parentModuleIds = [bestModule.id];
+                    addLog(`    [Auto-Map] Assigned new logic '${businessLogic.title}' to module '${bestModule.title}' (sim: ${maxSim.toFixed(2)})`);
                   }
                 }
-                // Use a threshold for module mapping during sync as well
-                if (bestModule && maxSim >= 0.7) {
-                  parentModuleIds = [bestModule.id];
-                  addLog(`    [Auto-Map] Assigned new logic '${businessLogic.title}' to module '${bestModule.title}' (sim: ${maxSim.toFixed(2)})`);
-                }
-              }
 
-              const logicData: Partial<Note> = {
-                id: logicId,
-                title: businessLogic.title.substring(0, 200),
-                projectId,
-                summary: businessLogic.summary || '',
-                components: businessLogic.components || null,
-                flow: businessLogic.flow || null,
-                io: businessLogic.io || null,
-                body: '',
-                folder: currentFile.path,
-                noteType: 'Logic',
-                status: 'Done',
-                priority: 'C',
-                parentNoteIds: parentModuleIds,
-                childNoteIds: [snapshotId],
-                relatedNoteIds: [],
-                uid: auth.currentUser?.uid || 'local',
-                lastUpdated: new Date().toISOString() as any,
-                sha: currentFile.sha,
-                lens: 'Feature',
-                ...(unitHash ? { contentHash: unitHash } : {}),
-                ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
-                ...(logicHash ? { embeddingHash: logicHash } : {}),
-                embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: new Date().toISOString() as any
-              };
-              localNotesBatch.push(logicData as Note);
+                const logicData: Partial<Note> = {
+                  id: logicId,
+                  title: businessLogic.title.substring(0, 200),
+                  projectId,
+                  summary: businessLogic.summary || '',
+                  components: businessLogic.components || null,
+                  flow: businessLogic.flow || null,
+                  io: businessLogic.io || null,
+                  body: '',
+                  folder: currentFile.path,
+                  noteType: 'Logic',
+                  status: 'Done',
+                  priority: 'C',
+                  parentNoteIds: parentModuleIds,
+                  childNoteIds: [snapshotId],
+                  relatedNoteIds: [],
+                  uid: auth.currentUser?.uid || 'local',
+                  lastUpdated: new Date().toISOString() as any,
+                  sha: currentFile.sha,
+                  lens: 'Feature',
+                  ...(unitHash ? { contentHash: unitHash } : {}),
+                  ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
+                  ...(logicHash ? { embeddingHash: logicHash } : {}),
+                  embeddingModel: 'gemini-embedding-2-preview',
+                  lastEmbeddedAt: new Date().toISOString() as any
+                };
+                localNotesBatch.push(logicData as Note);
 
-              // If we assigned a parent module, we need to update the module's childNoteIds
-              if (parentModuleIds.length > 0) {
-                // Update local module as well
-                const mod = existingModules.find(m => m.id === parentModuleIds[0]);
-                if (mod) {
-                  localNotesBatch.push({
-                    ...mod,
-                    childNoteIds: Array.from(new Set([...(mod.childNoteIds || []), logicId]))
-                  } as Note);
+                // If we assigned a parent module, we need to update the module's childNoteIds
+                if (parentModuleIds.length > 0) {
+                  // Update local module as well
+                  const mod = existingModules.find(m => m.id === parentModuleIds[0]);
+                  if (mod) {
+                    localNotesBatch.push({
+                      ...mod,
+                      childNoteIds: Array.from(new Set([...(mod.childNoteIds || []), logicId]))
+                    } as Note);
+                  }
                 }
-              }
-              
-              const snapshotData: Partial<Note> = {
-                id: snapshotId,
-                title: analysis.title.substring(0, 200),
-                projectId,
-                summary: analysis.summary || '',
-                components: analysis.components || null,
-                flow: analysis.flow || null,
-                io: analysis.io || null,
-                body: unit.code || '',
-                folder: currentFile.path,
-                noteType: 'Snapshot',
-                status: 'Done',
-                priority: 'Done',
-                parentNoteIds: [logicId],
-                childNoteIds: [],
-                relatedNoteIds: [],
-                originPath: currentFile.path,
-                sha: currentFile.sha,
-                uid: auth.currentUser?.uid || 'local',
-                lastUpdated: new Date().toISOString() as any,
-                lens: 'Snapshot',
-                ...(unitHash ? { contentHash: unitHash } : {})
-              };
-              localNotesBatch.push(snapshotData as Note);
-              
-              allNotes.push(logicData as Note);
-              allNotes.push(snapshotData as Note);
-              existingLogicNotes.push(logicData as Note);
-              if (logicAEmbedding) {
-                existingLogicEmbeddings.push(logicAEmbedding);
+                
+                const snapshotData: Partial<Note> = {
+                  id: snapshotId,
+                  title: analysis.title.substring(0, 200),
+                  projectId,
+                  summary: analysis.summary || '',
+                  components: analysis.components || null,
+                  flow: analysis.flow || null,
+                  io: analysis.io || null,
+                  body: unit.code || '',
+                  folder: currentFile.path,
+                  noteType: 'Snapshot',
+                  status: 'Done',
+                  priority: 'Done',
+                  parentNoteIds: [logicId],
+                  childNoteIds: [],
+                  relatedNoteIds: [],
+                  originPath: currentFile.path,
+                  sha: currentFile.sha,
+                  uid: auth.currentUser?.uid || 'local',
+                  lastUpdated: new Date().toISOString() as any,
+                  lens: 'Snapshot',
+                  ...(unitHash ? { contentHash: unitHash } : {})
+                };
+                localNotesBatch.push(snapshotData as Note);
+                
+                allNotes.push(logicData as Note);
+                allNotes.push(snapshotData as Note);
+                existingLogicNotes.push(logicData as Note);
+                if (logicAEmbedding) {
+                  existingLogicEmbeddings.push(logicAEmbedding);
+                }
               }
             }
-            
-            if (localNotesBatch.length >= 450) await commitBatch();
-          }
 
-          if (!cancelSyncRef.current) {
-            newShaMap[file.path] = file.sha;
-            processedCount++;
-          }
-          
-          await commitBatch();
+            if (!cancelSyncRef.current) {
+              newShaMap[file.path] = file.sha;
+              processedCount++;
+            }
+            
+            // Save notes incrementally per file
+            await commitBatch();
+            
+            // Incrementally save the ledger to prevent data loss if interrupted
+            const { id: _, ...ledgerBase } = ledger;
+            const incrementalLedgerData = {
+              ...ledgerBase,
+              fileShaMap: newShaMap,
+              lastSyncedAt: new Date().toISOString(),
+              uid: auth.currentUser?.uid || 'local'
+            };
+            await dbManager.saveSyncLedger(incrementalLedgerData as SyncLedger);
 
         } catch (err) {
           addLog(`Error processing file ${file.path}: ${err}`);

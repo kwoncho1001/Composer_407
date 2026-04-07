@@ -23,12 +23,14 @@ import {
   Settings,
   X,
   Cloud,
-  CloudOff
+  CloudOff,
+  RefreshCw,
+  CheckCircle2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Note, OperationType, LensType } from './types';
 import * as dbManager from './services/dbManager';
-import { syncNotes, isFirebaseBackupEnabled } from './services/syncManager';
+import { syncNotes, isFirebaseBackupEnabled, getBackupInterval, setBackupInterval, getLastBackupTime, backupToFirebase } from './services/syncManager';
 
 function MainApp() {
   const { user, loading: authLoading } = useAuth();
@@ -41,6 +43,11 @@ function MainApp() {
   const [activeLens, setActiveLens] = useState<LensType>('Feature');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [firebaseBackup, setFirebaseBackup] = useState(isFirebaseBackupEnabled());
+  
+  const [backupIntervalVal, setBackupIntervalVal] = useState(getBackupInterval());
+  const [dirtyCount, setDirtyCount] = useState(0);
+  const [lastBackupTime, setLastBackupTime] = useState<Date | null>(getLastBackupTime());
+  const [isBackingUp, setIsBackingUp] = useState(false);
 
   const toggleLeftSidebar = (open: boolean) => {
     setIsLeftOpen(open);
@@ -100,6 +107,67 @@ function MainApp() {
       });
     }
   }, [user, selectedProjectId, firebaseBackup]);
+
+  // Background Scheduler & Visibility Sync
+  useEffect(() => {
+    if (!firebaseBackup || !user || !selectedProjectId) return;
+
+    // 1. Periodic Sync
+    let intervalId: NodeJS.Timeout;
+    if (backupIntervalVal > 0) {
+      intervalId = setInterval(() => {
+        handleManualBackup();
+      }, backupIntervalVal);
+    }
+
+    // 2. Lifecycle Sync (when app is hidden/closed)
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        backupToFirebase(selectedProjectId).catch(console.error);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [firebaseBackup, backupIntervalVal, user, selectedProjectId]);
+
+  // Update dirty count periodically (for UI)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const dirtyNotes = await dbManager.getDirtyNotes();
+      setDirtyCount(dirtyNotes.length);
+      setLastBackupTime(getLastBackupTime());
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleManualBackup = async () => {
+    if (!selectedProjectId || !user || !firebaseBackup) return;
+    setIsBackingUp(true);
+    try {
+      await backupToFirebase(selectedProjectId);
+      const dirtyNotes = await dbManager.getDirtyNotes();
+      setDirtyCount(dirtyNotes.length);
+      setLastBackupTime(new Date());
+    } catch (error: any) {
+      if (error.message === 'QUOTA_EXCEEDED') {
+        alert("Firebase quota exceeded. Backup will resume tomorrow. Your data is safe locally.");
+      } else {
+        console.error("Backup failed:", error);
+      }
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
+  const handleBackupIntervalChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const val = parseInt(e.target.value, 10);
+    setBackupIntervalVal(val);
+    setBackupInterval(val);
+  };
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -204,6 +272,53 @@ function MainApp() {
                       <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${firebaseBackup ? 'translate-x-6' : 'translate-x-1'}`} />
                     </button>
                   </div>
+                  
+                  {firebaseBackup && (
+                    <div className="space-y-3 p-4 bg-muted/30 rounded-xl border border-border">
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm font-medium">Backup Interval</span>
+                        <select 
+                          value={backupIntervalVal} 
+                          onChange={handleBackupIntervalChange}
+                          className="bg-background border border-border rounded-md text-sm p-1"
+                        >
+                          <option value={0}>Manual Only</option>
+                          <option value={5 * 60 * 1000}>Every 5 minutes</option>
+                          <option value={15 * 60 * 1000}>Every 15 minutes</option>
+                          <option value={60 * 60 * 1000}>Every 1 hour</option>
+                        </select>
+                      </div>
+                      
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-muted-foreground">Pending Items:</span>
+                        <span className={`font-mono font-medium ${dirtyCount > 0 ? 'text-amber-500' : 'text-emerald-500'}`}>
+                          {dirtyCount}
+                        </span>
+                      </div>
+                      
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-muted-foreground">Last Backup:</span>
+                        <span className="text-muted-foreground text-xs">
+                          {lastBackupTime ? lastBackupTime.toLocaleTimeString() : 'Never'}
+                        </span>
+                      </div>
+
+                      <button 
+                        onClick={handleManualBackup}
+                        disabled={isBackingUp || dirtyCount === 0}
+                        className="w-full mt-2 py-2 px-4 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg flex items-center justify-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isBackingUp ? (
+                          <RefreshCw size={16} className="animate-spin" />
+                        ) : dirtyCount === 0 ? (
+                          <CheckCircle2 size={16} />
+                        ) : (
+                          <Cloud size={16} />
+                        )}
+                        {isBackingUp ? 'Backing up...' : dirtyCount === 0 ? 'Up to date' : 'Backup Now'}
+                      </button>
+                    </div>
+                  )}
                   
                   {!user && firebaseBackup && (
                     <p className="text-xs text-amber-500 bg-amber-500/10 p-3 rounded-lg border border-amber-500/20">
