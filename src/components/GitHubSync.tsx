@@ -3,10 +3,10 @@ import { fetchRepoTree, fetchFileContent } from '../services/github';
 import { analyzeLogicUnit, translateToBusinessLogic, checkImplementationConflict, mapLogicsToModulesBulk, getEmbeddingsBulk, cosineSimilarity, generateModuleFromCluster, generateDomainsFromModules } from '../services/gemini';
 import { kMeansClustering } from '../lib/clustering';
 import { parseCodeToNodes } from '../services/astParser';
-import { db, auth } from '../firebase';
-import { collection, addDoc, serverTimestamp, query, where, getDocs, doc, setDoc, updateDoc, arrayUnion, getDoc, deleteDoc, writeBatch } from 'firebase/firestore';
+import { auth } from '../firebase';
+import { isFirebaseBackupEnabled } from '../services/syncManager';
 import { Note, SyncLedger, OperationType, LensType } from '../types';
-import { handleFirestoreError, computeHash } from '../lib/utils';
+import { computeHash } from '../lib/utils';
 import * as dbManager from '../services/dbManager';
 import { Github, RefreshCw, AlertCircle, PanelRightClose, X, Trash2, ChevronDown, Loader2, Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
@@ -35,14 +35,15 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
     if (!projectId) return;
     const fetchProject = async () => {
       try {
-        const docSnap = await getDoc(doc(db, 'projects', projectId));
-        if (docSnap.exists() && docSnap.data().repoUrl) {
-          setRepoUrl(docSnap.data().repoUrl);
+        const projects = await dbManager.getAllProjects();
+        const project = projects.find(p => p.id === projectId);
+        if (project && project.repoUrl) {
+          setRepoUrl(project.repoUrl);
         } else {
           setRepoUrl('');
         }
       } catch (error) {
-        handleFirestoreError(error, OperationType.GET, `projects/${projectId}`);
+        console.error(error);
       }
     };
     fetchProject();
@@ -58,13 +59,14 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
   const handleSaveUrl = async () => {
     if (!projectId) return;
     try {
-      await updateDoc(doc(db, 'projects', projectId), { 
-        repoUrl,
-        uid: auth.currentUser?.uid
-      });
+      const projects = await dbManager.getAllProjects();
+      const project = projects.find(p => p.id === projectId);
+      if (project) {
+        await dbManager.saveProject({ ...project, repoUrl });
+      }
       addLog('Repository URL saved.');
     } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `projects/${projectId}`);
+      console.error(error);
     }
   };
 
@@ -74,7 +76,7 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
   };
 
   const handleAutoReconstruct = async () => {
-    if (!auth.currentUser || !projectId) return;
+    if (!projectId) return;
     
     let targetLens = activeLens;
     if (activeLens === 'Snapshot') {
@@ -108,41 +110,18 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
       // 1.5 Delete existing Domains and Modules for this lens
       if (existingLensNotes.length > 0) {
         addLog(`Clearing ${existingLensNotes.length} existing Domains/Modules for Lens: ${activeLens}...`);
-        let deleteBatch = writeBatch(db);
-        let deleteCount = 0;
-        
-        for (const note of existingLensNotes) {
-          deleteBatch.delete(doc(db, 'notes', note.id));
-          await dbManager.deleteNote(note.id);
-          deleteCount++;
-          if (deleteCount >= 450) {
-            await deleteBatch.commit();
-            deleteBatch = writeBatch(db);
-            deleteCount = 0;
-          }
-        }
-        if (deleteCount > 0) await deleteBatch.commit();
+        await dbManager.bulkDeleteNotes(existingLensNotes.map(n => n.id));
         
         // Remove these deleted module IDs from all Logic notes' parentNoteIds
         const deletedIds = new Set(existingLensNotes.map(n => n.id));
-        let updateBatch = writeBatch(db);
-        let updateCount = 0;
         const updatedLogics: Note[] = [];
         
         for (const logic of logicNotes) {
           if (logic.parentNoteIds && logic.parentNoteIds.some(id => deletedIds.has(id))) {
             const newParentIds = logic.parentNoteIds.filter(id => !deletedIds.has(id));
-            updateBatch.update(doc(db, 'notes', logic.id), { parentNoteIds: newParentIds });
             updatedLogics.push({ ...logic, parentNoteIds: newParentIds });
-            updateCount++;
-            if (updateCount >= 450) {
-              await updateBatch.commit();
-              updateBatch = writeBatch(db);
-              updateCount = 0;
-            }
           }
         }
-        if (updateCount > 0) await updateBatch.commit();
         if (updatedLogics.length > 0) await dbManager.bulkSaveNotes(updatedLogics);
         
         // Update logicNotes array with the cleaned parentNoteIds
@@ -170,16 +149,21 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
       if (textsToEmbed.length > 0) {
         addLog(`Fetching embeddings for ${textsToEmbed.length} notes...`);
         const newEmbeddings = await getEmbeddingsBulk(textsToEmbed);
+        const updatedLogicsForEmbeddings: Note[] = [];
         newEmbeddings.forEach((emb, i) => {
           const originalIdx = indicesToEmbed[i];
           logicEmbeddings[originalIdx] = emb;
           // Also update the logic note in DB so we don't have to embed again
-          const logicRef = doc(db, 'notes', logicNotes[originalIdx].id);
-          updateDoc(logicRef, {
+          const updatedLogic = {
+            ...logicNotes[originalIdx],
             embedding: emb,
-            lastEmbeddedAt: serverTimestamp()
-          });
+            lastEmbeddedAt: new Date().toISOString() as any
+          };
+          updatedLogicsForEmbeddings.push(updatedLogic);
         });
+        if (updatedLogicsForEmbeddings.length > 0) {
+          await dbManager.bulkSaveNotes(updatedLogicsForEmbeddings);
+        }
       }
 
       // 3. Cluster Logic notes using K-Means
@@ -234,34 +218,26 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
 
       addLog(`Blueprint generated with ${domainsBlueprint.domains.length} Domains.`);
 
-      // 6. Create Domains and Modules in Firestore
-      let batch = writeBatch(db);
-      let batchCount = 0;
+      // 6. Create Domains and Modules in Local DB
       let localNotesBatch: Note[] = [];
 
       const commitBatch = async () => {
-        if (batchCount > 0) {
+        if (localNotesBatch.length > 0) {
           try {
-            if (localNotesBatch.length > 0) {
-              const localNotes = localNotesBatch.map(note => ({
-                ...note,
-                lastUpdated: new Date().toISOString(),
-                lastEmbeddedAt: note.lastEmbeddedAt ? new Date().toISOString() : undefined
-              }));
-              await dbManager.bulkSaveNotes(localNotes as Note[]);
-            }
-            await batch.commit();
+            const localNotes = localNotesBatch.map(note => ({
+              ...note,
+              lastUpdated: new Date().toISOString(),
+              lastEmbeddedAt: note.lastEmbeddedAt ? new Date().toISOString() : undefined
+            }));
+            await dbManager.bulkSaveNotes(localNotes as Note[]);
           } finally {
-            batch = writeBatch(db);
-            batchCount = 0;
             localNotesBatch = [];
           }
         }
       };
 
       for (const domainData of domainsBlueprint.domains) {
-        const domainRef = doc(collection(db, 'notes'));
-        const domainId = domainRef.id;
+        const domainId = crypto.randomUUID();
         
         const domainNote: Note = {
           id: domainId,
@@ -276,23 +252,20 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
           parentNoteIds: [],
           childNoteIds: [],
           relatedNoteIds: [],
-          uid: auth.currentUser.uid,
-          lastUpdated: serverTimestamp(),
-          createdAt: serverTimestamp(),
+          uid: auth.currentUser?.uid || 'local',
+          lastUpdated: new Date().toISOString() as any,
+          createdAt: new Date().toISOString() as any,
           lens: 'Feature'
         };
 
-        batch.set(domainRef, domainNote);
         localNotesBatch.push(domainNote);
-        batchCount++;
 
         if (domainData.moduleIds) {
           for (const moduleIdKey of domainData.moduleIds) {
             const moduleData = generatedModules.find(m => m.id === moduleIdKey);
             if (!moduleData) continue;
 
-            const moduleRef = doc(collection(db, 'notes'));
-            const moduleId = moduleRef.id;
+            const moduleId = crypto.randomUUID();
             
             const [moduleEmbedding] = await getEmbeddingsBulk([`${moduleData.title} ${moduleData.summary || ''}`]);
             
@@ -309,34 +282,23 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
               parentNoteIds: [domainId],
               childNoteIds: moduleData.logicIds, // Map logics to this module
               relatedNoteIds: [],
-              uid: auth.currentUser.uid,
-              lastUpdated: serverTimestamp(),
-              createdAt: serverTimestamp(),
+              uid: auth.currentUser?.uid || 'local',
+              lastUpdated: new Date().toISOString() as any,
+              createdAt: new Date().toISOString() as any,
               embeddingHash: await computeHash(`${moduleData.title} ${moduleData.summary || ''}`),
               embeddingModel: 'gemini-embedding-2-preview',
-              lastEmbeddedAt: serverTimestamp(),
+              lastEmbeddedAt: new Date().toISOString() as any,
               embedding: moduleEmbedding,
               lens: 'Feature'
             };
 
-            batch.set(moduleRef, moduleNote);
             localNotesBatch.push(moduleNote);
-            batchCount++;
             
             // Update Domain's childNoteIds
             domainNote.childNoteIds.push(moduleId);
-            batch.update(domainRef, { childNoteIds: arrayUnion(moduleId) });
-            batchCount++;
 
-            // Update Logics to point to this Module in Firestore and Local Batch
+            // Update Logics to point to this Module in Local Batch
             for (const logicId of moduleData.logicIds) {
-              const logicRef = doc(db, 'notes', logicId);
-              batch.update(logicRef, {
-                parentNoteIds: arrayUnion(moduleId),
-                lastUpdated: serverTimestamp()
-              });
-              batchCount++;
-
               // Update local note object for IndexedDB
               const logicIdx = logicNotes.findIndex(l => l.id === logicId);
               if (logicIdx !== -1) {
@@ -349,7 +311,7 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
               }
             }
             
-            if (batchCount >= 400) await commitBatch();
+            if (localNotesBatch.length >= 400) await commitBatch();
           }
         }
       }
@@ -360,76 +322,29 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
 
     } catch (error) {
       addLog(`Auto-Reconstruct failed: ${error}`);
-      handleFirestoreError(error, OperationType.UPDATE, 'notes');
+      console.error(error);
     } finally {
       setIsReconstructing(false);
     }
   };
 
   const executeReset = async () => {
-    if (!projectId || !auth.currentUser) return;
+    if (!projectId) return;
     setResetting(true);
     setConfirmReset(false);
     addLog('Resetting snapshots and sync ledger...');
     try {
-      // 1. Delete all Snapshot notes for this project
-      const snapshotQuery = query(
-        collection(db, 'notes'),
-        where('uid', '==', auth.currentUser.uid),
-        where('projectId', '==', projectId),
-        where('noteType', '==', 'Snapshot')
-      );
-      const snapshotDocs = await getDocs(snapshotQuery);
-      
-      let batch = writeBatch(db);
-      let count = 0;
-      for (const d of snapshotDocs.docs) {
-        batch.delete(doc(db, 'notes', d.id));
-        count++;
-        if (count >= 450) {
-          await batch.commit();
-          batch = writeBatch(db);
-          count = 0;
-        }
-      }
-      if (count > 0) await batch.commit();
-      
-      addLog(`Deleted ${snapshotDocs.docs.length} snapshots.`);
-
-      // 2. Clear child references from all Logic notes (Snapshots are children)
-      const logicQuery = query(
-        collection(db, 'notes'),
-        where('uid', '==', auth.currentUser.uid),
-        where('projectId', '==', projectId),
-        where('noteType', '==', 'Logic')
-      );
-      const logicDocs = await getDocs(logicQuery);
-      batch = writeBatch(db);
-      count = 0;
-      for (const d of logicDocs.docs) {
-        batch.update(doc(db, 'notes', d.id), { 
-          childNoteIds: [] 
-        });
-        count++;
-        if (count >= 450) {
-          await batch.commit();
-          batch = writeBatch(db);
-          count = 0;
-        }
-      }
-      if (count > 0) await batch.commit();
-      
-      // 3. Sync with local DB (IndexedDB)
       const allLocalNotes = await dbManager.getAllNotes();
+      
+      // 1. Delete all Snapshot notes for this project
       const localSnapshots = allLocalNotes.filter(n => 
         n.projectId === projectId && 
         n.noteType === 'Snapshot'
       );
-      
-      for (const note of localSnapshots) {
-        await dbManager.deleteNote(note.id);
-      }
-      
+      await dbManager.bulkDeleteNotes(localSnapshots.map(n => n.id));
+      addLog(`Deleted ${localSnapshots.length} snapshots.`);
+
+      // 2. Clear child references from all Logic notes (Snapshots are children)
       const localLogics = allLocalNotes.filter(n => n.projectId === projectId && n.noteType === 'Logic');
       const updatedLogics = localLogics.map(l => ({ 
         ...l, 
@@ -439,20 +354,15 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
       if (updatedLogics.length > 0) {
         await dbManager.bulkSaveNotes(updatedLogics);
       }
-      
-      addLog(`Cleared snapshot references from ${logicDocs.docs.length} logic notes.`);
+      addLog(`Cleared snapshot references from ${localLogics.length} logic notes.`);
 
       // 4. Reset Sync Ledger
-      const ledgerQuery = query(
-        collection(db, 'syncLedgers'),
-        where('uid', '==', auth.currentUser.uid),
-        where('projectId', '==', projectId)
-      );
-      const ledgerDocs = await getDocs(ledgerQuery);
-      for (const ledgerDoc of ledgerDocs.docs) {
-        await updateDoc(doc(db, 'syncLedgers', ledgerDoc.id), { 
+      const ledger = await dbManager.getSyncLedger(projectId);
+      if (ledger) {
+        await dbManager.saveSyncLedger({
+          ...ledger,
           fileShaMap: {},
-          uid: auth.currentUser.uid 
+          uid: auth.currentUser?.uid || 'local'
         });
       }
       addLog('Sync ledger reset successfully.');
@@ -460,41 +370,32 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
       if (onSyncComplete) onSyncComplete();
     } catch (error) {
       addLog(`Reset failed: ${error}`);
-      handleFirestoreError(error, OperationType.DELETE, 'notes/reset');
+      console.error(error);
     } finally {
       setResetting(false);
     }
   };
 
   const handleSync = async () => {
-    if (!repoUrl || !auth.currentUser || !projectId) return;
+    if (!repoUrl || !projectId) return;
     setSyncing(true);
     cancelSyncRef.current = false;
     setLogs([]);
     addLog(`Starting sync for ${repoUrl}...`);
 
-    let batch = writeBatch(db);
-    let batchCount = 0;
     let localNotesBatch: Note[] = [];
 
     const commitBatch = async () => {
-      if (batchCount > 0) {
+      if (localNotesBatch.length > 0) {
         try {
-          if (localNotesBatch.length > 0) {
-            addLog(`Saving ${localNotesBatch.length} notes locally...`);
-            // Convert serverTimestamp to ISO string for local DB
-            const localNotes = localNotesBatch.map(note => ({
-              ...note,
-              lastUpdated: new Date().toISOString(),
-              lastEmbeddedAt: note.lastEmbeddedAt ? new Date().toISOString() : undefined
-            }));
-            await dbManager.bulkSaveNotes(localNotes as Note[]);
-          }
-          await batch.commit();
+          addLog(`Saving ${localNotesBatch.length} notes locally...`);
+          const localNotes = localNotesBatch.map(note => ({
+            ...note,
+            lastUpdated: new Date().toISOString(),
+            lastEmbeddedAt: note.lastEmbeddedAt ? new Date().toISOString() : undefined
+          }));
+          await dbManager.bulkSaveNotes(localNotes as Note[]);
         } finally {
-          // Always reset batch to avoid "batch already committed" errors even if commit fails
-          batch = writeBatch(db);
-          batchCount = 0;
           localNotesBatch = [];
         }
       }
@@ -502,26 +403,17 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
 
     try {
       // Update project repoUrl if changed
-      await updateDoc(doc(db, 'projects', projectId), { 
-        repoUrl,
-        uid: auth.currentUser.uid
-      });
+      const projects = await dbManager.getAllProjects();
+      const project = projects.find(p => p.id === projectId);
+      if (project) {
+        await dbManager.saveProject({ ...project, repoUrl });
+      }
 
       // 1. Fetch Ledger
-      const ledgerQuery = query(
-        collection(db, 'syncLedgers'), 
-        where('uid', '==', auth.currentUser.uid),
-        where('projectId', '==', projectId)
-      );
-      const ledgerSnap = await getDocs(ledgerQuery);
-      
-      let ledger: Partial<SyncLedger> = { repoUrl, projectId, fileShaMap: {}, uid: auth.currentUser.uid };
-      let ledgerId = '';
-
-      const existingLedger = ledgerSnap.docs.find(doc => doc.data().repoUrl === repoUrl);
-      if (existingLedger) {
-        ledgerId = existingLedger.id;
-        ledger = existingLedger.data() as SyncLedger;
+      let ledger: Partial<SyncLedger> = { repoUrl, projectId, fileShaMap: {}, uid: auth.currentUser?.uid || 'local' };
+      const existingLedger = await dbManager.getSyncLedger(projectId);
+      if (existingLedger && existingLedger.repoUrl === repoUrl) {
+        ledger = existingLedger;
       }
 
       // 2. Fetch Repo Tree
@@ -836,15 +728,13 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
             
             const { unit, file: currentFile, analysis, businessLogic, unitHash, caseType, targetLogicB, targetSnapshotB, isConflict, conflictDetails, logicAEmbedding, logicHash } = result;
 
-            const snapshotRef = targetSnapshotB ? doc(db, 'notes', targetSnapshotB.id) : doc(collection(db, 'notes'));
-            const snapshotId = targetSnapshotB ? targetSnapshotB.id : snapshotRef.id;
+            const snapshotId = targetSnapshotB ? targetSnapshotB.id : crypto.randomUUID();
             
             if (caseType === '4-1') {
-              const logicRef = doc(db, 'notes', targetLogicB.id);
               const logicUpdates: any = {
                 status: isConflict ? 'Conflict' : 'Done',
-                lastUpdated: serverTimestamp(),
-                uid: auth.currentUser.uid,
+                lastUpdated: new Date().toISOString(),
+                uid: auth.currentUser?.uid || 'local',
                 sha: currentFile.sha,
                 lens: 'Feature',
                 ...(conflictDetails ? { conflictDetails } : {}),
@@ -852,7 +742,7 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
                 ...(logicHash ? { embeddingHash: logicHash } : {}),
                 embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: serverTimestamp()
+                lastEmbeddedAt: new Date().toISOString()
               };
 
               if (!isConflict && !result.isCacheHit) {
@@ -864,14 +754,12 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 logicUpdates.conflictDetails = null;
               }
 
-              batch.update(logicRef, logicUpdates);
-              batchCount++;
               localNotesBatch.push({ ...targetLogicB, ...logicUpdates, id: targetLogicB.id } as Note);
               
               const snapshotUpdates: any = {
-                lastUpdated: serverTimestamp(),
+                lastUpdated: new Date().toISOString(),
                 sha: currentFile.sha,
-                uid: auth.currentUser.uid,
+                uid: auth.currentUser?.uid || 'local',
                 lens: 'Snapshot',
                 ...(unitHash ? { contentHash: unitHash } : {})
               };
@@ -885,17 +773,14 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 snapshotUpdates.body = unit.code;
               }
 
-              batch.update(snapshotRef, snapshotUpdates);
-              batchCount++;
               localNotesBatch.push({ ...targetSnapshotB, ...snapshotUpdates, id: targetSnapshotB.id } as Note);
               
             } else if (caseType === '4-2') {
-              const logicRef = doc(db, 'notes', targetLogicB.id);
               const logicUpdates: any = {
-                childNoteIds: arrayUnion(snapshotId),
+                childNoteIds: Array.from(new Set([...(targetLogicB.childNoteIds || []), snapshotId])),
                 status: isConflict ? 'Conflict' : 'Done',
-                lastUpdated: serverTimestamp(),
-                uid: auth.currentUser.uid,
+                lastUpdated: new Date().toISOString(),
+                uid: auth.currentUser?.uid || 'local',
                 sha: currentFile.sha,
                 lens: 'Feature',
                 ...(conflictDetails ? { conflictDetails } : {}),
@@ -903,15 +788,13 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
                 ...(logicHash ? { embeddingHash: logicHash } : {}),
                 embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: serverTimestamp()
+                lastEmbeddedAt: new Date().toISOString()
               };
 
               if (!isConflict) {
                 logicUpdates.conflictDetails = null;
               }
 
-              batch.update(logicRef, logicUpdates);
-              batchCount++;
               localNotesBatch.push({ ...targetLogicB, ...logicUpdates, id: targetLogicB.id } as Note);
               
               const snapshotData: Partial<Note> = {
@@ -932,19 +815,16 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 relatedNoteIds: [],
                 originPath: currentFile.path,
                 sha: currentFile.sha,
-                uid: auth.currentUser.uid,
-                lastUpdated: serverTimestamp(),
+                uid: auth.currentUser?.uid || 'local',
+                lastUpdated: new Date().toISOString() as any,
                 lens: 'Snapshot',
                 ...(unitHash ? { contentHash: unitHash } : {})
               };
-              batch.set(snapshotRef, snapshotData);
-              batchCount++;
               allNotes.push(snapshotData as Note);
               localNotesBatch.push(snapshotData as Note);
               
             } else if (caseType === '4-3') {
-              const logicRef = doc(collection(db, 'notes'));
-              const logicId = logicRef.id;
+              const logicId = crypto.randomUUID();
               
               // Find best matching module for the new logic note
               let parentModuleIds: string[] = [];
@@ -981,34 +861,26 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 parentNoteIds: parentModuleIds,
                 childNoteIds: [snapshotId],
                 relatedNoteIds: [],
-                uid: auth.currentUser.uid,
-                lastUpdated: serverTimestamp(),
+                uid: auth.currentUser?.uid || 'local',
+                lastUpdated: new Date().toISOString() as any,
                 sha: currentFile.sha,
                 lens: 'Feature',
                 ...(unitHash ? { contentHash: unitHash } : {}),
                 ...(logicAEmbedding ? { embedding: logicAEmbedding } : {}),
                 ...(logicHash ? { embeddingHash: logicHash } : {}),
                 embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: serverTimestamp()
+                lastEmbeddedAt: new Date().toISOString() as any
               };
-              batch.set(logicRef, logicData);
-              batchCount++;
               localNotesBatch.push(logicData as Note);
 
               // If we assigned a parent module, we need to update the module's childNoteIds
               if (parentModuleIds.length > 0) {
-                const moduleRef = doc(db, 'notes', parentModuleIds[0]);
-                batch.update(moduleRef, {
-                  childNoteIds: arrayUnion(logicId),
-                  lastUpdated: serverTimestamp()
-                });
-                batchCount++;
                 // Update local module as well
                 const mod = existingModules.find(m => m.id === parentModuleIds[0]);
                 if (mod) {
                   localNotesBatch.push({
                     ...mod,
-                    childNoteIds: [...(mod.childNoteIds || []), logicId]
+                    childNoteIds: Array.from(new Set([...(mod.childNoteIds || []), logicId]))
                   } as Note);
                 }
               }
@@ -1031,13 +903,11 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 relatedNoteIds: [],
                 originPath: currentFile.path,
                 sha: currentFile.sha,
-                uid: auth.currentUser.uid,
-                lastUpdated: serverTimestamp(),
+                uid: auth.currentUser?.uid || 'local',
+                lastUpdated: new Date().toISOString() as any,
                 lens: 'Snapshot',
                 ...(unitHash ? { contentHash: unitHash } : {})
               };
-              batch.set(snapshotRef, snapshotData);
-              batchCount++;
               localNotesBatch.push(snapshotData as Note);
               
               allNotes.push(logicData as Note);
@@ -1048,7 +918,7 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
               }
             }
             
-            if (batchCount >= 450) await commitBatch();
+            if (localNotesBatch.length >= 450) await commitBatch();
           }
 
           if (!cancelSyncRef.current) {
@@ -1075,20 +945,16 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
       const ledgerData = {
         ...ledgerBase,
         fileShaMap: newShaMap,
-        lastSyncedAt: serverTimestamp(),
-        uid: auth.currentUser.uid
+        lastSyncedAt: new Date().toISOString(),
+        uid: auth.currentUser?.uid || 'local'
       };
 
-      if (ledgerId) {
-        await setDoc(doc(db, 'syncLedgers', ledgerId), ledgerData);
-      } else {
-        await addDoc(collection(db, 'syncLedgers'), ledgerData);
-      }
+      await dbManager.saveSyncLedger(ledgerData as SyncLedger);
 
       addLog(`Sync complete! Processed ${processedCount} files.`);
     } catch (error) {
       addLog(`Sync failed: ${error}`);
-      handleFirestoreError(error, OperationType.WRITE, 'syncLedgers');
+      console.error(error);
     } finally {
       setSyncing(false);
       if (onSyncComplete) onSyncComplete();
@@ -1096,32 +962,25 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
   };
 
   const handleModuleMapping = async () => {
-    if (!auth.currentUser || !projectId) return;
+    if (!projectId) return;
     setIsMapping(true);
     cancelSyncRef.current = false;
     setLogs([]);
     addLog(`Starting Auto-Map Modules...`);
 
-    let batch = writeBatch(db);
-    let batchCount = 0;
     let localNotesBatch: Note[] = [];
 
     const commitBatch = async () => {
-      if (batchCount > 0) {
+      if (localNotesBatch.length > 0) {
         try {
-          if (localNotesBatch.length > 0) {
-            addLog(`Saving ${localNotesBatch.length} notes locally...`);
-            const localNotes = localNotesBatch.map(note => ({
-              ...note,
-              lastUpdated: new Date().toISOString(),
-              lastEmbeddedAt: note.lastEmbeddedAt ? new Date().toISOString() : undefined
-            }));
-            await dbManager.bulkSaveNotes(localNotes as Note[]);
-          }
-          await batch.commit();
+          addLog(`Saving ${localNotesBatch.length} notes locally...`);
+          const localNotes = localNotesBatch.map(note => ({
+            ...note,
+            lastUpdated: new Date().toISOString(),
+            lastEmbeddedAt: note.lastEmbeddedAt ? new Date().toISOString() : undefined
+          }));
+          await dbManager.bulkSaveNotes(localNotes as Note[]);
         } finally {
-          batch = writeBatch(db);
-          batchCount = 0;
           localNotesBatch = [];
         }
       }
@@ -1261,8 +1120,7 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
             if (newModulesCreatedInChunk[mapping.suggestedTitle]) {
               moduleId = newModulesCreatedInChunk[mapping.suggestedTitle].id;
             } else {
-              const moduleRef = doc(collection(db, 'notes'));
-              moduleId = moduleRef.id;
+              moduleId = crypto.randomUUID();
               
               // We calculate the embedding for the new module right away so it can be used for subsequent mappings
               const [newModuleEmbedding] = await getEmbeddingsBulk([`${mapping.suggestedTitle} ${mapping.suggestedSummary || ''}`]);
@@ -1280,11 +1138,11 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
                 parentNoteIds: [],
                 childNoteIds: [],
                 relatedNoteIds: [],
-                uid: auth.currentUser.uid,
-                lastUpdated: serverTimestamp(),
+                uid: auth.currentUser?.uid || 'local',
+                lastUpdated: new Date().toISOString() as any,
                 embeddingHash: await computeHash(`${mapping.suggestedTitle} ${mapping.suggestedSummary || ''}`),
                 embeddingModel: 'gemini-embedding-2-preview',
-                lastEmbeddedAt: serverTimestamp(),
+                lastEmbeddedAt: new Date().toISOString() as any,
                 embedding: newModuleEmbedding,
                 lens: 'Feature'
               };
@@ -1298,41 +1156,24 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
           }
 
           if (isNew && newModuleData) {
-            const moduleRef = doc(db, 'notes', newModuleData.id);
-            batch.set(moduleRef, newModuleData);
-            batchCount++;
             localNotesBatch.push(newModuleData as Note);
-            if (batchCount >= 450) await commitBatch();
+            if (localNotesBatch.length >= 450) await commitBatch();
           }
 
           if (moduleId) {
             // Update Logic Note
-            const logicRef = doc(db, 'notes', logic.id);
-            batch.update(logicRef, {
-              parentNoteIds: arrayUnion(moduleId),
-              lastUpdated: serverTimestamp(),
-              uid: auth.currentUser.uid
-            });
-            batchCount++;
-            localNotesBatch.push({ ...logic, parentNoteIds: [...logic.parentNoteIds, moduleId] } as Note);
-            if (batchCount >= 450) await commitBatch();
+            localNotesBatch.push({ ...logic, parentNoteIds: [...(logic.parentNoteIds || []), moduleId] } as Note);
+            if (localNotesBatch.length >= 450) await commitBatch();
 
             // Update Module Note
-            const moduleRef = doc(db, 'notes', moduleId);
-            batch.update(moduleRef, {
-              childNoteIds: arrayUnion(logic.id),
-              lastUpdated: serverTimestamp(),
-              uid: auth.currentUser.uid
-            });
-            batchCount++;
             const existingModule = existingModules.find(m => m.id === moduleId);
             if (existingModule) {
-              localNotesBatch.push({ ...existingModule, childNoteIds: [...existingModule.childNoteIds, logic.id] } as Note);
+              localNotesBatch.push({ ...existingModule, childNoteIds: [...(existingModule.childNoteIds || []), logic.id] } as Note);
             } else if (newModuleData && newModuleData.id === moduleId) {
               newModuleData.childNoteIds = [...(newModuleData.childNoteIds || []), logic.id];
               localNotesBatch.push(newModuleData as Note);
             }
-            if (batchCount >= 450) await commitBatch();
+            if (localNotesBatch.length >= 450) await commitBatch();
           }
         }
         await commitBatch();
@@ -1342,7 +1183,7 @@ export const GitHubSync = ({ onClose, projectId, onSyncComplete, activeLens, set
       addLog(`Auto-Map Modules complete!`);
     } catch (error) {
       addLog(`Auto-Map failed: ${error}`);
-      handleFirestoreError(error, OperationType.UPDATE, 'notes');
+      console.error(error);
     } finally {
       setIsMapping(false);
     }

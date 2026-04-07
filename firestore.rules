@@ -180,10 +180,10 @@ service cloud.firestore {
     }
 
     match /sync_manifests/{projectId} {
-      allow read: if isAuthenticated() && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid;
-      allow create: if isAuthenticated() && isValidSyncManifest(request.resource.data) && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid;
-      allow update: if isAuthenticated() && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid && isValidSyncManifest(request.resource.data);
-      allow delete: if isAuthenticated() && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid;
+      allow read: if isAuthenticated() && exists(/databases/$(database)/documents/projects/$(projectId)) && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid;
+      allow create: if isAuthenticated() && isValidSyncManifest(request.resource.data) && exists(/databases/$(database)/documents/projects/$(projectId)) && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid;
+      allow update: if isAuthenticated() && exists(/databases/$(database)/documents/projects/$(projectId)) && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid && isValidSyncManifest(request.resource.data);
+      allow delete: if isAuthenticated() && exists(/databases/$(database)/documents/projects/$(projectId)) && get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid;
     }
   }
 }

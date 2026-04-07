@@ -1,19 +1,21 @@
 import { openDB, IDBPDatabase } from 'idb';
-import { Note } from '../types';
+import { Note, Project, SyncLedger } from '../types';
 
 const DB_NAME = 'composer-db';
-const DB_VERSION = 2; // Incremented version
+const DB_VERSION = 3; // Incremented version
 const STORE_METADATA = 'notes_metadata';
 const STORE_CONTENTS = 'note_contents';
 const STORE_EMBEDDINGS = 'note_embeddings';
 const STORE_EDGES = 'edges';
+const STORE_PROJECTS = 'projects';
+const STORE_SYNC_LEDGERS = 'sync_ledgers';
 
 let dbPromise: Promise<IDBPDatabase<any>>;
 
 export const initDB = () => {
   if (!dbPromise) {
     dbPromise = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db) {
+      upgrade(db, oldVersion) {
         if (!db.objectStoreNames.contains(STORE_METADATA)) {
           db.createObjectStore(STORE_METADATA, { keyPath: 'id' });
         }
@@ -26,12 +28,51 @@ export const initDB = () => {
         if (!db.objectStoreNames.contains(STORE_EDGES)) {
           db.createObjectStore(STORE_EDGES, { keyPath: 'id' });
         }
+        if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
+          db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(STORE_SYNC_LEDGERS)) {
+          db.createObjectStore(STORE_SYNC_LEDGERS, { keyPath: 'id' });
+        }
       },
     });
   }
   return dbPromise;
 };
 
+// --- Projects ---
+export const getAllProjects = async (): Promise<Project[]> => {
+  const db = await initDB();
+  return db.getAll(STORE_PROJECTS);
+};
+
+export const saveProject = async (project: Project) => {
+  const db = await initDB();
+  await db.put(STORE_PROJECTS, project);
+};
+
+export const deleteProject = async (id: string) => {
+  const db = await initDB();
+  await db.delete(STORE_PROJECTS, id);
+};
+
+// --- Sync Ledgers ---
+export const getSyncLedger = async (projectId: string): Promise<SyncLedger | undefined> => {
+  const db = await initDB();
+  return db.get(STORE_SYNC_LEDGERS, projectId);
+};
+
+export const saveSyncLedger = async (ledger: SyncLedger) => {
+  const db = await initDB();
+  await db.put(STORE_SYNC_LEDGERS, ledger);
+};
+
+export const deleteSyncLedger = async (projectId: string) => {
+  const db = await initDB();
+  await db.delete(STORE_SYNC_LEDGERS, projectId);
+};
+
+// --- Notes ---
 export const getAllNotes = async (): Promise<Note[]> => {
   const db = await initDB();
   const [metadata, contents, embeddings, edges] = await Promise.all([

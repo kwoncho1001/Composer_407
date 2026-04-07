@@ -19,13 +19,16 @@ import {
   Folder,
   Layers,
   LayoutDashboard,
-  FileEdit
+  FileEdit,
+  Settings,
+  X,
+  Cloud,
+  CloudOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Note, OperationType, LensType } from './types';
-import { handleFirestoreError } from './lib/utils';
 import * as dbManager from './services/dbManager';
-import { syncNotes } from './services/syncManager';
+import { syncNotes, isFirebaseBackupEnabled } from './services/syncManager';
 
 function MainApp() {
   const { user, loading: authLoading } = useAuth();
@@ -36,6 +39,8 @@ function MainApp() {
   const [isRightOpen, setIsRightOpen] = useState(false);
   const [viewMode, setViewMode] = useState<'editor' | 'dashboard'>('dashboard');
   const [activeLens, setActiveLens] = useState<LensType>('Feature');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [firebaseBackup, setFirebaseBackup] = useState(isFirebaseBackupEnabled());
 
   const toggleLeftSidebar = (open: boolean) => {
     setIsLeftOpen(open);
@@ -86,7 +91,7 @@ function MainApp() {
   useEffect(() => {
     loadNotes();
 
-    if (user && selectedProjectId) {
+    if (user && selectedProjectId && firebaseBackup) {
       // Trigger background sync
       syncNotes(selectedProjectId, (updatedNotes) => {
         setProjectNotes(updatedNotes);
@@ -94,7 +99,7 @@ function MainApp() {
         console.error("Background sync failed:", err);
       });
     }
-  }, [user, selectedProjectId]);
+  }, [user, selectedProjectId, firebaseBackup]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -144,33 +149,74 @@ function MainApp() {
     setTheme(prev => prev === 'light' ? 'dark' : 'light');
   };
 
+  const toggleFirebaseBackup = () => {
+    const newVal = !firebaseBackup;
+    setFirebaseBackup(newVal);
+    localStorage.setItem('firebaseBackupEnabled', String(newVal));
+  };
+
   if (authLoading) {
     return <div className="h-screen flex items-center justify-center bg-background text-foreground">Loading...</div>;
   }
 
-  if (!user) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-background text-foreground p-4">
-        <div className="bg-card p-8 rounded-2xl shadow-xl border border-border text-center max-w-md w-full glass">
-          <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-6 glow-primary">
-            <div className="w-8 h-8 bg-primary rounded-lg"></div>
-          </div>
-          <h1 className="text-4xl font-bold mb-3 tracking-tight">Compose</h1>
-          <p className="text-muted-foreground mb-10 text-lg">Vibe coding blueprint & sync for solo developers.</p>
-          <button 
-            onClick={handleSignIn}
-            disabled={isSigningIn}
-            className="w-full py-4 bg-primary text-primary-foreground rounded-xl font-semibold hover:opacity-90 transition-all active:scale-[0.98] shadow-lg shadow-primary/20 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="flex h-screen bg-background text-foreground font-sans selection:bg-primary/30 selection:text-primary-foreground">
+      {/* Settings Modal */}
+      <AnimatePresence>
+        {isSettingsOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/80 backdrop-blur-sm p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
+            >
+              <div className="flex items-center justify-between p-4 border-b border-border">
+                <h2 className="text-lg font-bold flex items-center gap-2">
+                  <Settings size={20} className="text-primary" />
+                  Settings
+                </h2>
+                <button 
+                  onClick={() => setIsSettingsOpen(false)}
+                  className="p-1.5 text-muted-foreground hover:bg-muted rounded-lg transition-colors"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              <div className="p-6 space-y-6">
+                <div className="space-y-4">
+                  <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Data & Sync</h3>
+                  
+                  <div className="flex items-center justify-between p-4 bg-muted/50 rounded-xl border border-border">
+                    <div className="flex items-center gap-3">
+                      <div className={`p-2 rounded-lg ${firebaseBackup ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>
+                        {firebaseBackup ? <Cloud size={20} /> : <CloudOff size={20} />}
+                      </div>
+                      <div>
+                        <p className="font-medium">Firebase Backup</p>
+                        <p className="text-xs text-muted-foreground">Sync data to cloud</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={toggleFirebaseBackup}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${firebaseBackup ? 'bg-primary' : 'bg-muted-foreground/30'}`}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${firebaseBackup ? 'translate-x-6' : 'translate-x-1'}`} />
+                    </button>
+                  </div>
+                  
+                  {!user && firebaseBackup && (
+                    <p className="text-xs text-amber-500 bg-amber-500/10 p-3 rounded-lg border border-amber-500/20">
+                      You need to sign in to use Firebase Backup.
+                    </p>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Left Sidebar */}
       <motion.div 
         animate={{ width: isLeftOpen ? (typeof window !== 'undefined' && window.innerWidth < 640 ? '100%' : leftWidth) : 0 }}
@@ -248,6 +294,14 @@ function MainApp() {
               </div>
 
               <button 
+                onClick={() => setIsSettingsOpen(true)}
+                className="p-2 text-muted-foreground hover:bg-muted rounded-xl transition-all active:scale-95"
+                title="Settings"
+              >
+                <Settings size={18} />
+              </button>
+
+              <button 
                 onClick={toggleTheme}
                 className="p-2 text-muted-foreground hover:bg-muted rounded-xl transition-all active:scale-95 hidden sm:flex"
                 title={theme === 'light' ? 'Switch to Dark' : 'Switch to Light'}
@@ -255,22 +309,34 @@ function MainApp() {
                 {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
               </button>
               
-              <div className="flex items-center gap-2 sm:gap-3 px-1 sm:px-2 py-1.5 hover:bg-muted rounded-2xl transition-all cursor-pointer group">
-                <img 
-                  src={user.photoURL || `https://ui-avatars.com/api/?name=${user.displayName}`} 
-                  alt="Profile" 
-                  className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl border-2 border-border group-hover:border-primary transition-all shadow-md"
-                  referrerPolicy="no-referrer"
-                />
-                <div className="text-right hidden lg:block">
-                  <p className="text-xs font-bold leading-none group-hover:text-primary transition-colors">{user.displayName || 'Developer'}</p>
-                  <p className="text-[10px] text-muted-foreground/60 mt-0.5">{user.email}</p>
-                </div>
-              </div>
+              {user ? (
+                <>
+                  <div className="flex items-center gap-2 sm:gap-3 px-1 sm:px-2 py-1.5 hover:bg-muted rounded-2xl transition-all cursor-pointer group">
+                    <img 
+                      src={user.photoURL || `https://ui-avatars.com/api/?name=${user.displayName}`} 
+                      alt="Profile" 
+                      className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl border-2 border-border group-hover:border-primary transition-all shadow-md"
+                      referrerPolicy="no-referrer"
+                    />
+                    <div className="text-right hidden lg:block">
+                      <p className="text-xs font-bold leading-none group-hover:text-primary transition-colors">{user.displayName || 'Developer'}</p>
+                      <p className="text-[10px] text-muted-foreground/60 mt-0.5">{user.email}</p>
+                    </div>
+                  </div>
+                  <button onClick={logout} className="p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive rounded-xl transition-all active:scale-95" title="Sign out">
+                    <LogOut size={18} />
+                  </button>
+                </>
+              ) : (
+                <button 
+                  onClick={handleSignIn}
+                  disabled={isSigningIn}
+                  className="px-4 py-2 bg-primary text-primary-foreground text-sm font-bold rounded-xl hover:opacity-90 transition-all active:scale-95"
+                >
+                  {isSigningIn ? '...' : 'Sign In'}
+                </button>
+              )}
               
-              <button onClick={logout} className="p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive rounded-xl transition-all active:scale-95" title="Sign out">
-                <LogOut size={18} />
-              </button>
               <button 
                 onClick={() => toggleRightSidebar(!isRightOpen)}
                 className="p-2 text-muted-foreground hover:bg-muted rounded-xl transition-all active:scale-95"

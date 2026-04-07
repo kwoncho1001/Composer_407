@@ -1,8 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { doc, getDoc, setDoc, updateDoc, deleteDoc, serverTimestamp, collection, arrayUnion, arrayRemove } from 'firebase/firestore';
-import { db, auth } from '../firebase';
+import { auth } from '../firebase';
 import { Note, NoteType, NoteStatus, NotePriority, OperationType, CSuiteEvaluation } from '../types';
-import { handleFirestoreError } from '../lib/utils';
 import { Trash2, Save, Eye, Edit3, Sparkles, Loader2, AlertTriangle, CheckCircle2, FileWarning, PanelTop, Users, Code2, Megaphone, DollarSign } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -110,7 +108,7 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
   }, [note, isDirty]);
 
   const handleSave = async () => {
-    if (!auth.currentUser || !projectId) return;
+    if (!projectId) return;
     setIsSaving(true);
     try {
       let finalNoteId = noteId;
@@ -124,7 +122,7 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
           ...note,
           id: finalNoteId,
           projectId,
-          uid: auth.currentUser.uid,
+          uid: auth.currentUser?.uid || 'local',
           lastUpdated: new Date().toISOString()
         } as Note;
         await saveNoteToSync(noteToSave);
@@ -133,7 +131,7 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
           ...note,
           id: finalNoteId,
           lastUpdated: new Date().toISOString(),
-          uid: auth.currentUser.uid
+          uid: auth.currentUser?.uid || 'local'
         } as Note;
         await saveNoteToSync(noteToSave);
       }
@@ -197,7 +195,7 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
         ...note, 
         ...reformatted,
         lastUpdated: new Date().toISOString(),
-        uid: auth.currentUser?.uid
+        uid: auth.currentUser?.uid || 'local'
       } as Note;
       if (nextNote.status === 'Done' && nextNote.priority !== 'Done') {
         nextNote.priority = 'Done';
@@ -238,9 +236,10 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
       const filePath = await getFilePathForConflict();
       if (!filePath || filePath === '/') throw new Error("Could not determine the source file path for this logic.");
 
-      const projectDoc = await getDoc(doc(db, 'projects', projectId));
-      if (!projectDoc.exists()) throw new Error("Project not found");
-      const repoUrl = projectDoc.data().repoUrl;
+      const projects = await dbManager.getAllProjects();
+      const projectDoc = projects.find(p => p.id === projectId);
+      if (!projectDoc) throw new Error("Project not found");
+      const repoUrl = projectDoc.repoUrl;
       
       const fileContent = await fetchFileContent(repoUrl, filePath);
       const analyzed = await analyzeLogicUnit(note.title || '', fileContent);
@@ -256,7 +255,7 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
         priority: 'Done' as NotePriority,
         conflictDetails: null,
         lastUpdated: new Date().toISOString(),
-        uid: auth.currentUser?.uid
+        uid: auth.currentUser?.uid || 'local'
       } as Note;
       
       setIsSaving(true);
@@ -281,9 +280,10 @@ export const NoteEditor = ({ noteId, projectId, onSaved, onDeleted }: { noteId: 
       const filePath = await getFilePathForConflict();
       if (!filePath || filePath === '/') throw new Error("Could not determine the source file path for this logic.");
 
-      const projectDoc = await getDoc(doc(db, 'projects', projectId));
-      if (!projectDoc.exists()) throw new Error("Project not found");
-      const repoUrl = projectDoc.data().repoUrl;
+      const projects = await dbManager.getAllProjects();
+      const projectDoc = projects.find(p => p.id === projectId);
+      if (!projectDoc) throw new Error("Project not found");
+      const repoUrl = projectDoc.repoUrl;
       
       const fileContent = await fetchFileContent(repoUrl, filePath);
       const guide = await generateFixGuide(note as Note, fileContent);

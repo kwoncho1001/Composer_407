@@ -1,11 +1,18 @@
 import { collection, query, where, getDocs, doc, writeBatch, getDoc, setDoc, runTransaction, deleteDoc } from 'firebase/firestore';
 import { db, auth } from '../firebase';
 import { Note, SyncLedger, OperationType } from '../types';
-import { computeHash, handleFirestoreError, removeUndefined } from '../lib/utils';
+import { computeHash, removeUndefined } from '../lib/utils';
 import * as dbManager from './dbManager';
 
+export const isFirebaseBackupEnabled = () => {
+  return localStorage.getItem('firebaseBackupEnabled') === 'true';
+};
+
 export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) => void) => {
-  if (!auth.currentUser) return;
+  if (!auth.currentUser || !isFirebaseBackupEnabled()) {
+    const finalLocalNotes = await dbManager.getAllNotes();
+    return finalLocalNotes.filter(n => n.projectId === projectId);
+  }
 
   const lastSyncedAtKey = `lastSyncedAt_${projectId}`;
   const lastSyncedAtStr = localStorage.getItem(lastSyncedAtKey);
@@ -21,7 +28,10 @@ export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) 
       manifestData = manifestSnap.data().fileShaMap || {};
     }
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `sync_manifests/${projectId}`);
+    console.error("Firebase sync failed:", error);
+    // If Firebase fails, just return local notes
+    const finalLocalNotes = await dbManager.getAllNotes();
+    return finalLocalNotes.filter(n => n.projectId === projectId);
   }
 
   // 2. Get Local Data
@@ -189,7 +199,6 @@ export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) 
             manifestData[note.id] = cleanMetadata.lastUpdated;
           } catch (err) {
             console.error('Failed to upload note:', note.id, err);
-            handleFirestoreError(err, OperationType.WRITE, 'notes/' + note.id);
           }
         }
       }
@@ -199,7 +208,7 @@ export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) 
     try {
       await setDoc(manifestRef, { fileShaMap: manifestData }, { merge: true });
     } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `sync_manifests/${projectId}`);
+      console.error("Failed to update sync manifest", error);
     }
   }
 
@@ -227,7 +236,7 @@ export const syncNotes = async (projectId: string, onProgress?: (notes: Note[]) 
             return data;
           }
         } catch (error) {
-          handleFirestoreError(error, OperationType.GET, `notes/${id}`);
+          console.error("Failed to fetch remote note", id, error);
         }
         return null;
       });
@@ -254,6 +263,8 @@ export const deleteNoteFromSync = async (noteId: string, projectId: string) => {
   // Delete Local
   await dbManager.deleteNote(noteId);
 
+  if (!auth.currentUser || !isFirebaseBackupEnabled()) return;
+
   // Delete Remote
   try {
     await Promise.all([
@@ -262,7 +273,7 @@ export const deleteNoteFromSync = async (noteId: string, projectId: string) => {
       deleteDoc(doc(db, 'note_embeddings', noteId))
     ]);
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, 'notes/' + noteId);
+    console.error("Failed to delete remote note", error);
   }
 
   // Delete from Manifest
@@ -279,7 +290,7 @@ export const deleteNoteFromSync = async (noteId: string, projectId: string) => {
       }
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'sync_manifests/' + projectId);
+    console.error("Failed to update manifest after delete", error);
   }
 };
 
@@ -291,6 +302,8 @@ export const saveNoteToSync = async (note: Note) => {
 
   // Save Local
   await dbManager.saveNote(noteWithHash);
+
+  if (!auth.currentUser || !isFirebaseBackupEnabled()) return;
 
   // Save Remote - Partial Update
   const noteRef = doc(db, 'notes', note.id);
@@ -336,6 +349,6 @@ export const saveNoteToSync = async (note: Note) => {
       }, { merge: true });
     }
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'notes/' + note.id);
+    console.error("Failed to save remote note", error);
   }
 };

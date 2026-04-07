@@ -1,8 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { collection, onSnapshot, query, where, deleteDoc, doc, addDoc, serverTimestamp, getDocs, writeBatch } from 'firebase/firestore';
-import { db, auth } from '../firebase';
+import { auth } from '../firebase';
 import { Note, Project, OperationType, LensType } from '../types';
-import { handleFirestoreError } from '../lib/utils';
 import { Folder, FileText, Plus, CheckSquare, Trash2, PanelLeftClose, ChevronDown, Check, FolderGit2, Circle, CheckCircle2, RefreshCw, Sparkles, FoldVertical, UnfoldVertical } from 'lucide-react';
 import * as dbManager from '../services/dbManager';
 import { generateInitialBlueprint } from '../services/gemini';
@@ -95,73 +93,56 @@ export const Sidebar = ({
     selectedProjectIdRef.current = selectedProjectId;
   }, [onSelectProject, selectedProjectId]);
 
-  useEffect(() => {
-    if (!auth.currentUser) return;
-    const q = query(collection(db, 'projects'), where('uid', '==', auth.currentUser.uid));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const fetchedProjects = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Project));
+  const loadProjects = async () => {
+    try {
+      const fetchedProjects = await dbManager.getAllProjects();
       setProjects(fetchedProjects);
       if (fetchedProjects.length > 0 && !selectedProjectIdRef.current) {
         onSelectProjectRef.current(fetchedProjects[0].id);
       } else if (fetchedProjects.length === 0) {
         onSelectProjectRef.current(null);
       }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'projects');
-    });
-    return () => unsubscribe();
-  }, [auth.currentUser?.uid]);
+    } catch (error) {
+      console.error("Failed to load projects", error);
+    }
+  };
+
+  useEffect(() => {
+    loadProjects();
+  }, []);
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newProjectName.trim() || !auth.currentUser) return;
+    if (!newProjectName.trim()) return;
     
     setIsCreatingProject(true);
     try {
-      const docRef = await addDoc(collection(db, 'projects'), {
+      const projectId = crypto.randomUUID();
+      const newProject: Project = {
+        id: projectId,
         name: newProjectName.trim(),
         repoUrl: '',
-        uid: auth.currentUser.uid,
-        createdAt: serverTimestamp()
-      });
-      const projectId = docRef.id;
+        uid: auth.currentUser?.uid || 'local',
+        createdAt: new Date().toISOString()
+      };
+      
+      await dbManager.saveProject(newProject);
+      await loadProjects();
 
       onSelectProject(projectId);
       setIsCreatingProject(false);
       setNewProjectName('');
       setIsProjectMenuOpen(false);
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'projects');
+      console.error("Failed to create project", error);
       setIsCreatingProject(false);
     }
   };
 
   const executeDeleteProject = async (projectId: string) => {
-    if (!auth.currentUser) return;
     setIsDeletingProject(true);
 
     try {
-      // 1. Delete all notes for this project (Remote)
-      const notesQuery = query(
-        collection(db, 'notes'), 
-        where('uid', '==', auth.currentUser.uid),
-        where('projectId', '==', projectId)
-      );
-      const notesSnap = await getDocs(notesQuery);
-      
-      let batch = writeBatch(db);
-      let count = 0;
-      for (const d of notesSnap.docs) {
-        batch.delete(doc(db, 'notes', d.id));
-        count++;
-        if (count >= 450) {
-          await batch.commit();
-          batch = writeBatch(db);
-          count = 0;
-        }
-      }
-      if (count > 0) await batch.commit();
-
       // Delete all notes for this project (Local)
       const allLocalNotes = await dbManager.getAllNotes();
       const localNotesToDelete = allLocalNotes.filter(n => n.projectId === projectId).map(n => n.id);
@@ -169,22 +150,13 @@ export const Sidebar = ({
         await dbManager.bulkDeleteNotes(localNotesToDelete);
       }
 
-      // 2. Delete sync ledger
-      const ledgerQuery = query(
-        collection(db, 'syncLedgers'), 
-        where('uid', '==', auth.currentUser.uid),
-        where('projectId', '==', projectId)
-      );
-      const ledgerSnap = await getDocs(ledgerQuery);
-      for (const d of ledgerSnap.docs) {
-        await deleteDoc(doc(db, 'syncLedgers', d.id));
-      }
+      // Delete sync ledger (Local)
+      await dbManager.deleteSyncLedger(projectId);
 
-      // Delete sync_manifests
-      await deleteDoc(doc(db, 'sync_manifests', projectId));
+      // Delete project (Local)
+      await dbManager.deleteProject(projectId);
 
-      // 3. Delete project
-      await deleteDoc(doc(db, 'projects', projectId));
+      await loadProjects();
 
       if (selectedProjectId === projectId) {
         onSelectProject(null);
@@ -193,7 +165,7 @@ export const Sidebar = ({
       setIsProjectMenuOpen(false);
       setProjectToDeleteId(null);
     } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, `projects/${projectId}`);
+      console.error("Failed to delete project", error);
     } finally {
       setIsDeletingProject(false);
     }
